@@ -1,171 +1,162 @@
-'use strict';
-// Study AI — offline extractive intelligence over the user's own material.
-const zlib = require('zlib');
+// Study AI: dependency-free PDF text extraction + extractive analysis (summary, key points, flashcards, quiz).
+import { inflateSync } from 'node:zlib';
 
-const STOP = new Set(('a an the and or but if then else of to in on at by for with from as is are was were be been being this that these those it its into over under about than so such not no nor can could may might will would shall should do does did done have has had having which who whom whose what when where why how also very more most much many some any each other their there here they them he she his her we our you your i me my mine also just only own same too both few between during before after above below up down out off again further once all etc one two ' +
-  'hai hain ho tha thi the ka ki ke ko se me mein par aur ya yeh ye woh wo kya jo to bhi hi nahi').split(/\s+/));
+// ───────────────────────────── PDF → text (best effort) ─────────────────────────────
+function parseCMap(src) {
+  const map = new Map();
+  const hex = (h) => String.fromCodePoint(...(h.match(/.{1,4}/g) || []).map((x) => parseInt(x, 16)));
+  for (const blk of src.matchAll(/beginbfchar([\s\S]*?)endbfchar/g))
+    for (const m of blk[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g)) map.set(parseInt(m[1], 16), hex(m[2]));
+  for (const blk of src.matchAll(/beginbfrange([\s\S]*?)endbfrange/g))
+    for (const m of blk[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*(?:<([0-9a-fA-F]+)>|\[([^\]]*)\])/g)) {
+      const a = parseInt(m[1], 16), b = parseInt(m[2], 16);
+      if (m[3]) { const base = parseInt(m[3], 16); for (let c = a; c <= b && c - a < 65536; c++) map.set(c, String.fromCodePoint(base + c - a)); }
+      else { const arr = [...m[4].matchAll(/<([0-9a-fA-F]+)>/g)].map((x) => x[1]); for (let c = a; c <= b; c++) if (arr[c - a]) map.set(c, hex(arr[c - a])); }
+    }
+  return map;
+}
 
-/* ---------- PDF → text (minimal, dependency-free) ---------- */
-function extractPdfText(buf) {
-  const src = buf.toString('latin1');
-  const out = [];
-  let idx = 0;
-  while (true) {
-    const s = src.indexOf('stream', idx);
-    if (s < 0) break;
-    const e = src.indexOf('endstream', s);
-    if (e < 0) break;
-    const dictStart = src.lastIndexOf('obj', s);
-    const dict = src.slice(Math.max(0, dictStart), s);
-    let start = s + 6; if (src[start] === '\r') start++; if (src[start] === '\n') start++;
-    let chunk = buf.subarray(start, e);
-    idx = e + 9;
-    if (/\/Subtype\s*\/(Image|Form)|\/Type\s*\/(XObject|ObjStm|XRef)|\/FontFile/.test(dict)) continue;
-    if (/FlateDecode/.test(dict)) { try { chunk = zlib.inflateSync(chunk); } catch { try { chunk = zlib.inflateRawSync(chunk); } catch { continue; } } }
-    const content = chunk.toString('latin1');
-    if (!/\bBT\b/.test(content)) continue;
-    out.push(textFromContent(content));
+export function extractPdfText(buf) {
+  const bin = buf.toString('latin1');
+  if (!bin.startsWith('%PDF')) throw new Error('That does not look like a PDF file.');
+  // 1) index objects → decoded stream / dictionary text
+  const objs = new Map();
+  for (const m of bin.matchAll(/(\d+)\s+\d+\s+obj([\s\S]*?)endobj/g)) {
+    const body = m[2];
+    const sm = body.match(/stream\r?\n/);
+    let dict = body, data = null;
+    if (sm) {
+      dict = body.slice(0, sm.index);
+      const start = sm.index + sm[0].length, end = body.lastIndexOf('endstream');
+      let raw = Buffer.from(body.slice(start, end > start ? end : undefined), 'latin1');
+      if (/FlateDecode/.test(dict)) { try { raw = inflateSync(raw); } catch { try { raw = inflateSync(raw.subarray(0, raw.length - 1)); } catch { raw = null; } } }
+      data = raw;
+    }
+    objs.set(+m[1], { dict, data });
   }
-  let text = out.join('\n').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
-  const printable = (text.match(/[A-Za-zऀ-ॿ0-9 .,;:()'"!?-]/g) || []).length;
-  const ratio = text.length ? printable / text.length : 0;
-  return { text, ok: text.length > 40 && ratio > 0.85 };
-}
-function unescapePdf(str) {
-  return str.replace(/\\([nrtbf()\\]|[0-7]{1,3}|\r?\n)/g, (_, c) => {
-    if (c === 'n') return '\n'; if (c === 'r') return '\r'; if (c === 't') return '\t'; if (c === 'b' || c === 'f') return '';
-    if (c === '(' || c === ')' || c === '\\') return c; if (/^\r?\n$/.test(c)) return '';
-    return String.fromCharCode(parseInt(c, 8));
-  });
-}
-function textFromContent(c) {
-  let res = '';
-  const blocks = c.match(/BT[\s\S]*?ET/g) || [];
-  for (const b of blocks) {
-    const re = /\[((?:\\.|[^\]])*)\]\s*TJ|\(((?:\\.|[^\\)])*)\)\s*(?:Tj|'|")|<([0-9A-Fa-f\s]+)>\s*Tj|(-?[\d.]+)\s+(-?[\d.]+)\s+T[dD]|T\*|ET/g;
-    let m;
-    while ((m = re.exec(b))) {
-      if (m[1] !== undefined) {
-        const parts = m[1].match(/\((?:\\.|[^\\)])*\)|-?[\d.]+/g) || [];
-        for (const p of parts) {
-          if (p[0] === '(') res += unescapePdf(p.slice(1, -1));
-          else if (parseFloat(p) < -180) res += ' ';
+  // 2) font resource name → ToUnicode map
+  const cmaps = new Map();
+  const fontCMap = new Map();
+  const cmapOf = (n) => { if (!cmaps.has(n)) { const o = objs.get(n); cmaps.set(n, o?.data ? parseCMap(o.data.toString('latin1')) : null); } return cmaps.get(n); };
+  const fontObjMap = new Map();
+  for (const [n, o] of objs) {
+    const tu = o.dict.match(/\/ToUnicode\s+(\d+)\s+0\s+R/);
+    if (tu && /\/Type\s*\/Font\b/.test(o.dict)) fontObjMap.set(n, +tu[1]);
+  }
+  for (const [, o] of objs) {
+    for (const blk of o.dict.matchAll(/\/Font\s*<<([^>]*)>>/g))
+      for (const f of blk[1].matchAll(/\/([\w+.-]+)\s+(\d+)\s+0\s+R/g)) if (fontObjMap.has(+f[2])) fontCMap.set(f[1], cmapOf(fontObjMap.get(+f[2])));
+  }
+  // 3) walk content streams
+  const decode = (bytes, cmap) => {
+    if (!cmap || !cmap.size) return bytes.toString('latin1');
+    const wide = [...cmap.keys()].some((k) => k > 255);
+    let s = '';
+    if (wide) for (let i = 0; i + 1 < bytes.length; i += 2) s += cmap.get((bytes[i] << 8) | bytes[i + 1]) ?? '';
+    else for (const b of bytes) s += cmap.get(b) ?? String.fromCharCode(b);
+    return s;
+  };
+  const unescape = (s) => Buffer.from(s.replace(/\\([nrtbf()\\]|[0-7]{1,3}|\r?\n)/g, (_, c) => ({ n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', '(': '(', ')': ')', '\\': '\\' }[c] ?? (/^[0-7]/.test(c) ? String.fromCharCode(parseInt(c, 8)) : ''))), 'latin1');
+  let text = '';
+  for (const [, o] of objs) {
+    if (!o.data || /\/Type\s*\/(XObject|Font|ObjStm|XRef|Metadata)|\/Subtype\s*\/(Image|Type1C|CIDFontType)|\/FontFile|\/Length1/.test(o.dict)) continue;
+    const s = o.data.toString('latin1');
+    if (!/\bBT\b/.test(s)) continue;
+    let cmap = null;
+    const tokRe = /\/([\w+.-]+)\s+[\d.]+\s+Tf|\(((?:\\.|[^\\()])*)\)\s*(?:Tj|'|")|<([0-9a-fA-F\s]+)>\s*Tj|\[((?:\\.|[^\]])*)\]\s*TJ|(T\*|Td|TD|Tm|ET)\b/g;
+    for (const m of s.matchAll(tokRe)) {
+      if (m[1]) cmap = fontCMap.get(m[1]) || null;
+      else if (m[2] !== undefined) text += decode(unescape(m[2]), cmap);
+      else if (m[3]) text += decode(Buffer.from(m[3].replace(/\s/g, ''), 'hex'), cmap);
+      else if (m[4] !== undefined) {
+        for (const p of m[4].matchAll(/\(((?:\\.|[^\\()])*)\)|<([0-9a-fA-F\s]+)>|(-?\d+(?:\.\d+)?)/g)) {
+          if (p[1] !== undefined) text += decode(unescape(p[1]), cmap);
+          else if (p[2]) text += decode(Buffer.from(p[2].replace(/\s/g, ''), 'hex'), cmap);
+          else if (p[3] && +p[3] < -180) text += ' ';
         }
-      } else if (m[2] !== undefined) res += unescapePdf(m[2]);
-      else if (m[3] !== undefined) { const h = m[3].replace(/\s/g, ''); for (let i = 0; i + 1 < h.length; i += 2) { const code = parseInt(h.substr(i, 2), 16); if (code >= 32 && code < 127) res += String.fromCharCode(code); } }
-      else if (m[4] !== undefined) { if (Math.abs(parseFloat(m[5])) > 2) res += '\n'; else res += ' '; }
-      else res += '\n';
+      } else if (m[5]) text += m[5] === 'ET' || m[5] === 'Td' || m[5] === 'TD' || m[5] === 'Tm' || m[5] === 'T*' ? '\n' : '';
     }
-    res += '\n';
+    text += '\n';
   }
-  return res;
+  text = text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').replace(/[^\S\n]{2,}/g, ' ').trim();
+  // join lines that are mid-sentence
+  text = text.split('\n').reduce((acc, line) => { const l = line.trim(); if (!l) return acc + '\n'; return acc + (acc && !/\n$/.test(acc) && !/[.:!?]$/.test(acc.trimEnd()) && /^[a-z(]/.test(l) ? ' ' : acc && !/\n$/.test(acc) ? '\n' : '') + l; }, '');
+  if (text.replace(/\s/g, '').length < 40) throw new Error('I could not read text from this PDF (it may be scanned or use a custom font). Paste the text instead — I will not guess.');
+  return text;
 }
 
-/* ---------- text utilities ---------- */
-function clean(text) {
-  let t = String(text || '').replace(/\r/g, '').replace(/ /g, ' ').replace(/[ \t]+/g, ' ');
-  // re-join hard-wrapped lines
-  t = t.replace(/([^\n.!?:।])\n(?=[a-z(])/g, '$1 ');
-  return t.replace(/\n{3,}/g, '\n\n').trim();
-}
-function sentences(text) {
-  return clean(text).split(/\n{2,}|(?<=[.!?।])\s+(?=[A-Z0-9"'(ऀ-ॿ])/).map((s) => s.replace(/\s+/g, ' ').trim()).filter((s) => s.length > 25 && s.length < 420);
-}
-const words = (s) => (s.toLowerCase().match(/[a-zऀ-ॿ][a-zऀ-ॿ'-]+/g) || []);
+// ───────────────────────────── analysis ─────────────────────────────
+const STOP = new Set(`a an the and or but if then else of to in on at by for with from as is are was were be been being it its this that these those he she they we you i his her their our your my me him them us not no yes do does did done have has had will would can could should may might must shall also just than so such very more most much many some any each other into over under about between through during before after above below up down out off again further once here there when where why how all both few own same too only can't don't won't isn't aren't which who whom what while because until against among within without upon per via etc ie eg hai hain ka ki ke ko se me mein par aur ya bhi to yeh ye woh wo hota hoti hote kar karo kiya gaya gayi liye`.split(/\s+/));
+const tokens = (s) => (s.toLowerCase().match(/[\p{L}][\p{L}\p{N}'-]{2,}/gu) || []).filter((w) => !STOP.has(w));
+export const sentences = (text) => text.replace(/\s+/g, ' ').split(/(?<=[.!?।])\s+(?=[A-Z0-9ऀ-ॿ"'(])/).map((s) => s.trim()).filter((s) => s.length > 25 && s.length < 400);
 
-function termFreq(text) {
-  const f = new Map();
-  for (const w of words(text)) if (w.length > 2 && !STOP.has(w)) f.set(w, (f.get(w) || 0) + 1);
-  return f;
-}
-function keyTerms(text, k = 10) {
-  const f = termFreq(text);
-  // bonus for Capitalised phrases / defined terms
-  for (const m of text.matchAll(/\b([A-Z][a-z]{3,}(?:\s[A-Z][a-z]{3,})?)\b/g)) { const w = m[1].toLowerCase(); if (f.has(w)) f.set(w, f.get(w) + 1.5); }
-  return [...f.entries()].sort((a, b) => b[1] - a[1]).slice(0, k).map(([w]) => w);
-}
-function summarize(text, n = 5) {
-  const ss = sentences(text);
-  if (ss.length <= n) return ss;
-  const f = termFreq(text); const max = Math.max(...f.values(), 1);
-  const scored = ss.map((s, i) => {
-    const ws = words(s).filter((w) => f.has(w));
-    let sc = ws.reduce((a, w) => a + f.get(w) / max, 0) / Math.sqrt(ws.length + 4);
-    if (i < 3) sc *= 1.25;
-    if (/\b(is|are|means|defined|called|refers|therefore|thus|important|key)\b/i.test(s)) sc *= 1.15;
-    return { s, i, sc };
-  });
-  return scored.sort((a, b) => b.sc - a.sc).slice(0, n).sort((a, b) => a.i - b.i).map((x) => x.s);
-}
-function flashcards(text, n = 10) {
-  const ss = sentences(text); const cards = []; const used = new Set();
-  const terms = keyTerms(text, 25);
-  for (const s of ss) {
-    const m = s.match(/^(?:An?\s+|The\s+)?([A-Za-z][\w\s()/-]{2,50}?)\s+(?:is|are|means|refers to|is defined as|is called|can be defined as)\s+(.{20,})$/i);
-    if (m && !used.has(m[1].toLowerCase()) && m[1].split(' ').length <= 6) {
-      used.add(m[1].toLowerCase());
-      cards.push({ q: `What ${/ are /i.test(s.slice(0, 70)) ? 'are' : 'is'} ${m[1].trim()}?`, a: s, kind: 'definition' });
-    }
-    if (cards.length >= n) return cards;
+export function analyze(text, title = 'Document') {
+  text = String(text).replace(/\r/g, '').trim();
+  const sents = sentences(text);
+  const freq = new Map();
+  for (const w of tokens(text)) freq.set(w, (freq.get(w) || 0) + 1);
+  const maxF = Math.max(1, ...freq.values());
+  const score = (s, i) => {
+    const ws = tokens(s); if (!ws.length) return 0;
+    let v = ws.reduce((a, w) => a + (freq.get(w) || 0) / maxF, 0) / Math.sqrt(ws.length + 3);
+    if (i < 3) v *= 1.25;
+    if (/\b(is|are|means|refers to|defined as|called|known as|consists of|used to)\b/i.test(s)) v *= 1.3;
+    if (/\d/.test(s)) v *= 1.05;
+    return v;
+  };
+  const ranked = sents.map((s, i) => ({ s, i, v: score(s, i) })).sort((a, b) => b.v - a.v);
+  const top = (n) => ranked.slice(0, n).sort((a, b) => a.i - b.i).map((x) => x.s);
+  const keywords = [...freq.entries()].filter(([w]) => w.length > 3).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([w, c]) => ({ word: w, count: c }));
+
+  // flashcards: definitions first, then cloze deletions
+  const cards = []; const seen = new Set();
+  const defRe = /^([A-Z][\w\s\-/()]{2,50}?)\s+(?:is|are|refers to|is defined as|are defined as|means|can be defined as|is known as|is called)\s+(.{15,220}?)[.!?]?$/;
+  for (const s of sents) {
+    const m = s.match(defRe) || s.match(/^([\w\s\-/()]{3,45}):\s+(.{15,220})$/);
+    if (m && !seen.has(m[1].toLowerCase()) && tokens(m[1]).length <= 5) { seen.add(m[1].toLowerCase()); cards.push({ q: `What is ${m[1].trim()}?`, a: m[2].trim().replace(/[.!?]?$/, '.'), term: m[1].trim(), kind: 'definition' }); }
+    if (cards.length >= 10) break;
   }
-  for (const s of ss) {
-    const t = terms.find((t) => new RegExp('\\b' + t + '\\b', 'i').test(s));
-    if (t && !used.has(t) && s.length < 220) {
-      used.add(t);
-      cards.push({ q: s.replace(new RegExp('\\b' + t + '\\b', 'i'), '_____'), a: t, kind: 'cloze', hint: s.slice(0, 0) });
-    }
-    if (cards.length >= n) break;
+  const kwSet = keywords.map((k) => k.word);
+  for (const { s } of ranked) {
+    if (cards.length >= 12) break;
+    const hit = kwSet.find((k) => new RegExp(`\\b${k}\\b`, 'i').test(s));
+    if (!hit || seen.has(s)) continue;
+    seen.add(s);
+    cards.push({ q: s.replace(new RegExp(`\\b${hit}\\b`, 'i'), '_____'), a: hit, term: hit, kind: 'cloze' });
   }
-  return cards;
-}
-function revisionNotes(text, title = 'Revision notes') {
-  const ss = sentences(text);
-  if (!ss.length) return `# ${title}\n\n(No readable text found.)`;
-  const chunk = Math.max(4, Math.ceil(ss.length / 6));
-  let md = `# ${title}\n\n`;
-  md += `**Key terms:** ${keyTerms(text, 8).join(' · ')}\n\n`;
-  for (let i = 0; i < ss.length; i += chunk) {
-    const part = ss.slice(i, i + chunk); const joined = part.join(' ');
-    const head = keyTerms(joined, 2).map((w) => w[0].toUpperCase() + w.slice(1)).join(' & ') || 'Section';
-    md += `## ${head}\n`;
-    for (const s of summarize(joined, Math.min(3, part.length))) md += `- ${s}\n`;
-    md += '\n';
+  // revision notes: group top sentences under their dominant keyword
+  const groups = new Map();
+  for (const s of top(10)) {
+    const k = kwSet.find((w) => new RegExp(`\\b${w}\\b`, 'i').test(s)) || 'General';
+    (groups.get(k) || groups.set(k, []).get(k)).push(s);
   }
-  return md.trim();
-}
-/** Answer a question from a document by retrieving the most relevant sentences. */
-function retrieve(text, question, n = 3) {
-  const qw = new Set(words(question).filter((w) => !STOP.has(w) && w.length > 2));
-  if (!qw.size) return [];
-  return sentences(text).map((s, i) => ({ s, i, sc: words(s).filter((w) => qw.has(w)).length / Math.sqrt(words(s).length + 6) }))
-    .filter((x) => x.sc > 0).sort((a, b) => b.sc - a.sc).slice(0, n).sort((a, b) => a.i - b.i).map((x) => x.s);
+  const revision = [...groups.entries()].map(([h, b]) => ({ heading: h.charAt(0).toUpperCase() + h.slice(1), bullets: b }));
+  const words = text.split(/\s+/).length;
+  return { title, wordCount: words, readMinutes: Math.max(1, Math.round(words / 200)), summary: top(4), keyPoints: top(8), keywords, revision, flashcards: cards };
 }
 
-/* ---------- study planner ---------- */
-function studyPlan({ subject, days = 1, hours = 2, topics = [], startTs, ctx, localParts, toTs }) {
-  days = Math.max(1, Math.min(30, Math.round(days)));
-  const sessions = [];
-  const per = Math.max(1, Math.round(hours * 60));
-  const p0 = localParts(ctx, startTs);
-  const startHour = days === 1 && p0.h >= 6 ? Math.min(22, p0.h + 1) : 17;
-  const labelFor = (i, total) => (total === 1 ? ['Learn', 'Practice', 'Revise'][i] : i === total - 1 ? 'Mock test + weak spots' : ['Learn', 'Practice', 'Revise'][i % 3]);
-  if (days === 1) {
-    const split = [0.45, 0.35, 0.2];
-    let cur = startHour * 60 + p0.mi * 0 ;
-    ['Learn', 'Practice', 'Revise'].forEach((lbl, i) => {
-      const mins = Math.max(15, Math.round(per * split[i] / 5) * 5);
-      const topic = topics[i] ? ` — ${topics[i]}` : '';
-      sessions.push({ day: 0, label: lbl, title: `${subject}: ${lbl}${topic}`, mins, ts: toTs(ctx, p0.y, p0.mo, p0.d, Math.floor(cur / 60) % 24, cur % 60) });
-      cur += mins + 10;
-    });
-  } else {
-    for (let d = 0; d < days; d++) {
-      const lbl = d === days - 1 ? 'Mock test + weak spots' : d % 3 === 2 ? 'Revise' : d % 3 === 1 ? 'Practice' : 'Learn';
-      const topic = topics.length && d < days - 1 ? ` — ${topics[d % topics.length]}` : '';
-      sessions.push({ day: d, label: lbl, title: `${subject}: ${lbl}${topic}`, mins: per, ts: toTs(ctx, p0.y, p0.mo, p0.d + d, 17, 0) });
-    }
-  }
-  return sessions;
+export function makeQuiz(analysis, n = 6) {
+  const cards = analysis.flashcards || [];
+  const terms = [...new Set([...cards.map((c) => c.term), ...(analysis.keywords || []).map((k) => k.word)])];
+  const shuffle = (a) => a.map((x) => [Math.random(), x]).sort((x, y) => x[0] - y[0]).map((x) => x[1]);
+  return shuffle(cards).slice(0, n).map((c) => {
+    const distract = shuffle(terms.filter((t) => t.toLowerCase() !== c.term.toLowerCase())).slice(0, 3);
+    const options = shuffle([c.term, ...distract]);
+    return { prompt: c.kind === 'definition' ? `Which term fits this description?\n“${c.a}”` : `Fill the blank:\n${c.q}`, options, answer: options.indexOf(c.term), explain: c.kind === 'definition' ? `${c.term}: ${c.a}` : c.q.replace('_____', `**${c.term}**`) };
+  }).filter((q) => q.options.length >= 3);
 }
 
-module.exports = { extractPdfText, clean, sentences, keyTerms, summarize, flashcards, revisionNotes, retrieve, studyPlan };
+/** Offline "explain": retrieve the most relevant sentences from the user's own documents. */
+export function explainFromDocs(topic, docs) {
+  const qw = new Set(tokens(topic));
+  if (!qw.size) return null;
+  const found = [];
+  for (const d of docs) {
+    for (const s of sentences(d.text)) {
+      const sw = tokens(s); const hit = sw.filter((w) => qw.has(w)).length;
+      if (hit) found.push({ s, doc: d.title, v: hit / Math.sqrt(sw.length + 2) });
+    }
+  }
+  found.sort((a, b) => b.v - a.v);
+  return found.slice(0, 4);
+}

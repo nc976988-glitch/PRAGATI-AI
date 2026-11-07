@@ -1,70 +1,46 @@
-'use strict';
-// scrypt password hashing + HMAC-signed bearer tokens. No third-party code.
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const { db, save, uid } = require('./store');
+import { scryptSync, randomBytes, timingSafeEqual, createHmac } from 'node:crypto';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { q, nowISO, audit } from './db.js';
 
-const SECRET_FILE = path.join(__dirname, '..', '..', 'data', '.secret');
-let SECRET = process.env.PRAGATI_SECRET;
-if (!SECRET) {
-  try { SECRET = fs.readFileSync(SECRET_FILE, 'utf8'); }
-  catch { SECRET = crypto.randomBytes(32).toString('hex'); fs.mkdirSync(path.dirname(SECRET_FILE), { recursive: true }); fs.writeFileSync(SECRET_FILE, SECRET, { mode: 0o600 }); }
-}
+const SECRET_FILE = new URL('../data/secret.key', import.meta.url).pathname;
+mkdirSync(new URL('../data', import.meta.url).pathname, { recursive: true });
+if (!existsSync(SECRET_FILE)) writeFileSync(SECRET_FILE, randomBytes(32).toString('hex'), { mode: 0o600 });
+const SECRET = process.env.PRAGATI_SECRET || readFileSync(SECRET_FILE, 'utf8');
+
 const b64 = (b) => Buffer.from(b).toString('base64url');
-const TTL = 1000 * 60 * 60 * 24 * 7;
+const sign = (s) => createHmac('sha256', SECRET).update(s).digest('base64url');
 
-function sign(payload) {
-  const body = b64(JSON.stringify(payload));
-  const mac = crypto.createHmac('sha256', SECRET).update(body).digest('base64url');
-  return body + '.' + mac;
+export function makeToken(uid, days = 7) {
+  const body = b64(JSON.stringify({ uid, exp: Date.now() + days * 864e5 }));
+  return `${body}.${sign(body)}`;
 }
-function verify(token) {
-  if (!token || !token.includes('.')) return null;
-  const [body, mac] = token.split('.');
-  const good = crypto.createHmac('sha256', SECRET).update(body).digest('base64url');
-  const a = Buffer.from(mac), b = Buffer.from(good);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
-  try {
-    const p = JSON.parse(Buffer.from(body, 'base64url').toString());
-    return p.exp > Date.now() ? p : null;
-  } catch { return null; }
+export function verifyToken(tok) {
+  if (!tok || !tok.includes('.')) return null;
+  const [body, sig] = tok.split('.');
+  const exp = sign(body);
+  if (sig.length !== exp.length || !timingSafeEqual(Buffer.from(sig), Buffer.from(exp))) return null;
+  try { const p = JSON.parse(Buffer.from(body, 'base64url').toString()); return p.exp > Date.now() ? p : null; } catch { return null; }
 }
-const hash = (pw, salt) => crypto.scryptSync(pw, salt, 64).toString('hex');
+const hashPw = (pw, salt) => scryptSync(pw, salt, 64).toString('hex');
 
-function publicUser(u) {
-  return { id: u.id, name: u.name, email: u.email, settings: u.settings, created: u.created, demo: !!u.demo };
-}
-function defaults() {
-  return { privacy: false, lang: 'hinglish', voiceReply: true, perms: { mic: true, notifications: true, aiProvider: true, storeHistory: true } };
-}
-
-function register({ name, email, password, demo = false }) {
-  name = String(name || '').trim().slice(0, 60);
+export function register({ email, password, name }, guest = 0) {
   email = String(email || '').trim().toLowerCase();
-  if (!name) throw httpErr(400, 'Please tell us your name.');
-  if (!/^\S+@\S+\.\S+$/.test(email)) throw httpErr(400, 'Enter a valid email.');
-  if (String(password || '').length < 6) throw httpErr(400, 'Password needs at least 6 characters.');
-  if (Object.values(db.users).some((u) => u.email === email)) throw httpErr(409, 'That email already has an account — try signing in.');
-  const salt = crypto.randomBytes(16).toString('hex');
-  const u = { id: uid('usr'), name, email, salt, passHash: hash(password, salt), created: Date.now(), settings: defaults(), demo };
-  db.users[u.id] = u; save();
-  return u;
+  if (!/^\S+@\S+\.\S+$/.test(email)) throw httpErr(400, 'Enter a valid email address.');
+  if (!guest && String(password || '').length < 6) throw httpErr(400, 'Password must be at least 6 characters.');
+  if (q.get('SELECT id FROM users WHERE email=?', email)) throw httpErr(409, 'That email is already registered.');
+  const salt = randomBytes(16).toString('hex');
+  const r = q.run('INSERT INTO users(email,name,salt,hash,is_guest,created) VALUES(?,?,?,?,?,?)',
+    email, (name || email.split('@')[0]).slice(0, 40), salt, hashPw(password, salt), guest, nowISO());
+  audit(Number(r.lastInsertRowid), guest ? 'guest.created' : 'account.created', email);
+  return Number(r.lastInsertRowid);
 }
-function login({ email, password }) {
-  email = String(email || '').trim().toLowerCase();
-  const u = Object.values(db.users).find((x) => x.email === email);
-  if (!u) throw httpErr(401, 'Email or password is incorrect.');
-  const a = Buffer.from(hash(String(password || ''), u.salt)), b = Buffer.from(u.passHash);
-  if (!crypto.timingSafeEqual(a, b)) throw httpErr(401, 'Email or password is incorrect.');
-  return u;
+export function login({ email, password }) {
+  const u = q.get('SELECT * FROM users WHERE email=?', String(email || '').trim().toLowerCase());
+  if (!u) throw httpErr(401, 'Wrong email or password.');
+  const a = Buffer.from(hashPw(String(password || ''), u.salt)), b = Buffer.from(u.hash);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) throw httpErr(401, 'Wrong email or password.');
+  audit(u.id, 'login', '');
+  return u.id;
 }
-const issue = (u) => sign({ sub: u.id, exp: Date.now() + TTL });
-function fromReq(req) {
-  const h = req.headers.authorization || '';
-  const p = verify(h.startsWith('Bearer ') ? h.slice(7) : '');
-  return p && db.users[p.sub] ? db.users[p.sub] : null;
-}
-function httpErr(status, message) { const e = new Error(message); e.status = status; return e; }
-
-module.exports = { register, login, issue, fromReq, publicUser, httpErr };
+export const publicUser = (u) => ({ id: u.id, name: u.name, email: u.email, guest: !!u.is_guest });
+export function httpErr(status, message) { const e = new Error(message); e.status = status; return e; }

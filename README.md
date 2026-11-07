@@ -35,3 +35,18 @@ Voice input uses the browser Speech API, so use **Chrome or Edge**. Typing works
 `server.js` HTTP+SSE API · `lib/` engine, NLU, study, LLM, auth, store · `public/` ES-module frontend (no build step) · `test/api.test.js` end-to-end test (`npm test`). `server/` is an older generation kept from the original folder and is not used.
 
 See `PITCH.md` for the 3-minute demo script and likely judge questions.
+
+
+## Deploy on Render
+
+This repository is configured for a Render Node web service.
+
+- **Root Directory:** leave blank (repository root)
+- **Build Command:** `npm install`
+- **Start Command:** `npm start`
+- **Health Check Path:** `/api/health`
+- Node version: 22 (via `.node-version`)
+
+Important: deploy the contents of this folder as the repository root. Do not set the Root Directory to `src` and do not use `node src/server.js`. The correct entry point is `server.js` in the repository root, alongside `lib/` and `public/`.
+
+The app uses a local JSON data store. On Render's free service, local files may be lost when the service restarts or redeploys. Use a persistent disk or external database before storing important user data.

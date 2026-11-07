@@ -1,64 +1,81 @@
-'use strict';
-// Work AI — email drafts, meeting → action items, report skeletons. Template-driven offline, LLM-enriched when available.
-const nlu = require('./nlu');
+// Work AI + drafting helpers. Template-driven offline; the optional Claude provider (llm.js) can upgrade them.
+const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 
-const CATS = [
-  ['extension', /extension|more time|deadline|postpone|reschedul|delay/i],
-  ['leave', /leave|absent|sick|medical|unwell|fever|not able to attend|miss (the )?class/i],
-  ['meeting', /meeting|appointment|meet\b|discuss|catch ?up|call with|slot/i],
-  ['internship', /internship|intern\b|job|apply|application|opportunit|position|role\b/i],
-  ['followup', /follow ?-?up|checking in|status|any update|haven'?t heard/i],
-  ['apology', /apolog|sorry|my mistake|inconvenience/i],
-  ['thanks', /thank|grateful|appreciat/i],
-  ['recommendation', /recommendation|lor\b|reference letter/i],
-];
-const formalTo = (to) => /prof|sir|madam|ma'?am|dr\.?|dean|hod|head|director|manager|hr|recruit|team|committee/i.test(to || '') || !to;
-
-function draftEmail({ purpose = '', to = '', tone = 'formal', sender = 'Student', details = '' }) {
-  const text = `${purpose} ${details}`.trim();
-  const cat = (CATS.find(([, re]) => re.test(text)) || ['general'])[0];
-  const formal = tone !== 'friendly';
-  const greet = formal ? (formalTo(to) ? (to && !/^(sir|madam)/i.test(to) ? `Respected ${to},` : 'Respected Sir/Madam,') : `Dear ${to},`) : `Hi ${to || 'there'},`;
-  const bye = formal ? `Thank you for your time and consideration.\n\nYours sincerely,\n${sender}` : `Thanks a lot!\n\nBest,\n${sender}`;
-  const reason = details.trim() ? details.trim().replace(/\.$/, '') : '';
-  const P = {
-    extension: { s: 'Request for deadline extension', b: `I hope you are doing well. I am writing to request a short extension for ${reason || 'the upcoming submission'}.\n\nI have been working on it steadily, but ${reason ? 'given the circumstances' : 'a few unavoidable constraints'} I will not be able to do justice to the work by the current deadline. With an additional 2–3 days, I can submit a complete and well-checked version.\n\nI will gladly share my current progress if that would help.` },
-    leave: { s: 'Leave request', b: `I am writing to request leave${reason ? ' because ' + reason : ''}. I will be unable to attend on the dates concerned and will catch up on all missed material and assignments on my return.\n\nPlease let me know if any documents or further details are needed.` },
-    meeting: { s: 'Request for a meeting', b: `I would like to request a short meeting${reason ? ' to discuss ' + reason : ''}. I can adjust to your schedule — a 15–20 minute slot this week would be ideal.\n\nPlease let me know a time that suits you.` },
-    internship: { s: 'Application — ' + (reason || 'Internship opportunity'), b: `I am writing to express my interest in ${reason || 'the opportunity at your organisation'}. I am a student with hands-on project experience and a strong interest in learning from real-world work.\n\nI have attached my résumé for your review and would be glad to discuss how I can contribute.` },
-    followup: { s: 'Following up' + (reason ? ': ' + reason : ''), b: `I am following up on my earlier message${reason ? ' regarding ' + reason : ''}. I understand you may be busy, and I would appreciate any update when convenient.\n\nPlease let me know if you need anything further from my side.` },
-    apology: { s: 'Apologies' + (reason ? ' — ' + reason : ''), b: `I sincerely apologise${reason ? ' for ' + reason : ' for the inconvenience'}. It was not my intention, and I am taking steps to make sure it does not happen again.\n\nThank you for your understanding.` },
-    thanks: { s: 'Thank you', b: `I wanted to thank you${reason ? ' for ' + reason : ' for your time and guidance'}. It was genuinely helpful, and I appreciate the effort you put in.` },
-    recommendation: { s: 'Request for a recommendation letter', b: `I hope you are well. I am applying for ${reason || 'an opportunity'} and would be honoured if you could write a letter of recommendation for me.\n\nI can share my résumé, key projects and a short summary of our work together to make this easier. The deadline is flexible and I will keep you updated.` },
-    general: { s: reason ? reason[0].toUpperCase() + reason.slice(1, 60) : 'Quick note', b: `I am writing regarding ${reason || purpose || 'a matter I would like your help with'}.\n\nPlease let me know if you need any more information from my side.` },
-  }[cat];
-  return { category: cat, subject: P.s, body: `${greet}\n\n${P.b}\n\n${bye}`, to };
+export function draftEmail({ to = '', purpose = 'a quick follow-up', tone = 'friendly', points = [], sender = '' } = {}) {
+  const formal = tone === 'formal';
+  const name = to ? (/^(prof|dr|mr|ms|mrs)/i.test(to) ? to : /professor|sir|ma'?am|hr|manager|dean|principal|teacher/i.test(to) ? cap(to) : to) : '';
+  const greet = formal ? `Dear ${name || 'Sir/Madam'},` : `Hi ${name || 'there'},`;
+  const p = purpose.replace(/^(an?|the)\s+/i, '');
+  const subject = cap(p.length > 60 ? p.slice(0, 57) + '…' : p);
+  const bullets = points.length ? `\n\nKey points:\n${points.map((x) => `• ${x}`).join('\n')}` : '';
+  const body = formal
+    ? `${greet}\n\nI hope you are doing well. I am writing regarding ${p}.${bullets}\n\nI would be grateful for your guidance on this and am happy to share any further details you may need.\n\nThank you for your time and consideration.\n\nRegards,\n${sender || '[Your name]'}`
+    : `${greet}\n\nQuick note about ${p}.${bullets}\n\nLet me know what works for you — happy to adjust.\n\nThanks!\n${sender || '[Your name]'}`;
+  return { subject, body };
 }
 
-function extractActions(transcript, ctx) {
-  const lines = String(transcript || '').split(/\n|(?<=[.!?])\s+/).map((l) => l.trim()).filter((l) => l.length > 8);
-  const cues = /\b(will|shall|needs? to|need to|has to|have to|must|should|to do|todo|action|assign(?:ed)?|take care|responsible|follow up|owner|by (?:mon|tue|wed|thu|fri|sat|sun|tomorrow|eod|eow|next)|karna hai|karega|karegi|dena hai)\b/i;
-  const out = [];
-  for (const l of lines) {
-    if (!cues.test(l)) continue;
-    let owner = null; const om = l.match(/^(?:[-*•]\s*)?([A-Z][a-z]{2,15})(?:\s+(?:will|to|should|must|needs? to|has to)\b)/) || l.match(/\b(?:assigned to|owner[:\s]+|@)([A-Z][a-z]{2,15})/);
-    if (om) owner = om[1];
-    const when = nlu.parseWhen(l, ctx);
-    let title = l.replace(/^[-*•\d.\s]+/, '').replace(/^(action( item)?s?[:\-]\s*)/i, '');
-    out.push({ title: title.length > 140 ? title.slice(0, 137) + '…' : title, owner, ts: when ? when.ts : null });
-  }
-  return out.slice(0, 12);
+export function draftStudyNotes(subject, docs = []) {
+  const s = subject || 'Study notes';
+  const doc = subject ? docs.find((d) => d.title.toLowerCase().includes(subject.toLowerCase().split(' ')[0])) : docs[0];
+  let analysis = null;
+  try { analysis = doc ? JSON.parse(doc.analysis) : null; } catch { /* ignore */ }
+  const kp = analysis?.keyPoints?.slice(0, 6).map((x) => `- ${x}`).join('\n');
+  const body = [
+    `# ${s}`, '',
+    '## Overview', analysis?.summary?.join(' ') || '_Write the 2-line big picture here._', '',
+    '## Key concepts', kp || '- \n- \n- ', '',
+    '## Definitions & formulae', '- ', '',
+    '## Worked example', '_Add one example you solved yourself._', '',
+    '## Doubts to ask', '- ', '',
+    '## Revision checklist', '- [ ] Re-read once\n- [ ] Close the book and write the 5 main ideas\n- [ ] Solve 3 problems',
+  ].join('\n');
+  return { title: `Notes — ${s}`, body, fromDoc: doc?.title || null };
 }
 
-const REPORTS = {
-  weekly: ['Weekly status report', ['Summary (2–3 lines)', 'Completed this week', 'In progress', 'Blockers & risks', 'Plan for next week', 'Help needed']],
-  lab: ['Lab report', ['Aim', 'Apparatus / software', 'Theory', 'Procedure', 'Observations & data', 'Calculations / results', 'Discussion & error analysis', 'Conclusion', 'References']],
-  project: ['Project report', ['Abstract', 'Problem statement', 'Objectives', 'Literature / prior work', 'Methodology', 'Implementation', 'Results', 'Limitations', 'Future work', 'References']],
-  meeting: ['Minutes of meeting', ['Date, time, attendees', 'Agenda', 'Discussion points', 'Decisions taken', 'Action items (owner · due)', 'Next meeting']],
-  incident: ['Incident post-mortem', ['What happened', 'Impact', 'Timeline', 'Root cause', 'What went well / badly', 'Corrective actions']],
-};
-function reportSkeleton(kind, topic = '') {
-  const [title, sections] = REPORTS[kind] || REPORTS.project;
-  return `# ${title}${topic ? ' — ' + topic : ''}\n\n` + sections.map((s) => `## ${s}\n_…_\n`).join('\n');
+export function planDayNote(ctx) {
+  const open = (ctx.tasks || []).filter((t) => !t.done);
+  const rank = { high: 0, normal: 1, low: 2 };
+  const sorted = [...open].sort((a, b) => (rank[a.priority] ?? 1) - (rank[b.priority] ?? 1) || (a.due || '9').localeCompare(b.due || '9')).slice(0, 8);
+  const N = new Date(ctx.now + ctx.tz * 60000);
+  let h = N.getUTCHours() + 1, mi = 0;
+  const lines = sorted.map((t) => {
+    const hh = h % 12 || 12, ap = h % 24 < 12 ? 'AM' : 'PM';
+    const line = `- ${hh}:${String(mi).padStart(2, '0')} ${ap} — ${t.title}${t.priority === 'high' ? ' ★' : ''}`;
+    h += 1; return line;
+  });
+  return {
+    title: "Today's plan",
+    reason: sorted.length ? `Ordered ${sorted.length} open tasks by priority and due time, one hour each.` : 'You have no open tasks — the note leaves room to add some.',
+    body: `# Today's plan\n\n${lines.join('\n') || '- Nothing open. Add a task or ask Pragati to plan your study.'}\n\n_Built from your real task list — edit freely._`,
+  };
 }
-module.exports = { draftEmail, extractActions, reportSkeleton, REPORT_KINDS: Object.fromEntries(Object.entries(REPORTS).map(([k, v]) => [k, v[0]])) };
+
+// ─────────── meeting notes → decisions + action items (extractive, offline) ───────────
+export function meetingDigest(raw) {
+  const lines = String(raw).split(/\n+|(?<=[.!?])\s+/).map((l) => l.trim()).filter((l) => l.length > 3);
+  const action = /\b(will|shall|to do|todo|action|owner|assign|by (mon|tue|wed|thu|fri|sat|sun|tomorrow|eod|next)|deadline|follow[- ]?up|needs? to|should|must|karna|karenge|kal tak)\b/i;
+  const decision = /\b(decided|decision|agreed|approved|finali[sz]ed|resolved|confirmed|go with|we will go)\b/i;
+  const actions = lines.filter((l) => action.test(l) && !decision.test(l)).slice(0, 10);
+  const decisions = lines.filter((l) => decision.test(l)).slice(0, 8);
+  const rest = lines.filter((l) => !actions.includes(l) && !decisions.includes(l));
+  const summary = rest.slice(0, 3).join(' ') || lines.slice(0, 3).join(' ');
+  return { summary, decisions, actions: actions.map((a) => a.replace(/^[-•*\d.)\s]+/, '')) };
+}
+
+export function weeklyReport({ tasks, notes, now, tz, name }) {
+  const weekAgo = now - 7 * 864e5;
+  const done = tasks.filter((t) => t.done && t.completed && Date.parse(t.completed) >= weekAgo);
+  const open = tasks.filter((t) => !t.done);
+  const high = open.filter((t) => t.priority === 'high');
+  const newNotes = notes.filter((n) => Date.parse(n.created) >= weekAgo);
+  const rate = tasks.length ? Math.round((tasks.filter((t) => t.done).length / tasks.length) * 100) : 0;
+  const body = [
+    `# Weekly progress report — ${name || 'me'}`,
+    `_Generated ${new Date(now + tz * 60000).toUTCString().slice(0, 16)} from live data in Pragati._`, '',
+    `## Highlights`, `- ${done.length} task${done.length === 1 ? '' : 's'} completed this week`, `- ${newNotes.length} note${newNotes.length === 1 ? '' : 's'} written`, `- Overall completion: ${rate}%`, '',
+    `## Completed`, done.map((t) => `- ✔ ${t.title}`).join('\n') || '- (none yet)', '',
+    `## In progress / next`, open.slice(0, 8).map((t) => `- ${t.title}${t.priority === 'high' ? ' (high priority)' : ''}`).join('\n') || '- (nothing open)', '',
+    `## Risks & blockers`, high.length ? high.map((t) => `- ${t.title} is high priority and still open`).join('\n') : '- None flagged', '',
+  ].join('\n');
+  return { title: 'Weekly progress report', body };
+}

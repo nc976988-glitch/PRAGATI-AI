@@ -1,193 +1,297 @@
-'use strict';
-// Pragati NLU — rule-based intent + time understanding for English / Hindi / Hinglish.
-// Runs fully offline. (An LLM can enrich answers on top, but plans never depend on it.)
+// Pragati intent engine — an offline, deterministic planner for English / Hindi / Hinglish.
+// It turns ONE utterance into a visible chain of PROPOSED steps. Nothing is executed here.
+import { draftEmail, draftStudyNotes, planDayNote } from './work.js';
 
-const DEV = /[ऀ-ॿ]/;
-const HINGLISH_WORDS = /\b(hai|hain|ho|karo|kar|karna|karni|karde|kardo|kal|aaj|parso|baje|bje|mujhe|mera|meri|mere|yaad|dilana|dila|padhai|padhna|shaam|subah|raat|dopahar|aur|phir|fir|banao|bana|likh|likho|batao|samjhao|samjha|kya|kaise|kyun|nahi|haan|bhai|yaar|ghante|ghanta|din|wala|wali|ke liye|ko|se|tak|taiyari|tayari|hisaab|jaldi)\b/i;
-
-function detectLang(text) {
-  if (DEV.test(text)) return 'hi';
-  const hits = (text.toLowerCase().match(new RegExp(HINGLISH_WORDS.source, 'gi')) || []).length;
+// ───────────────────────────── language ─────────────────────────────
+const HINGLISH = /\b(kal|aaj|aj|parso|baje|bje|mujhe|mera|meri|mere|karo|kardo|karna|karni|yaad|dilao|dila|padhai|padhna|padh|banao|bana|shaam|subah|subha|raat|dopahar|hai|hain|kya|ka|ki|ke|liye|aur|phir|fir|nahi|bhi|jaldi|zaroori|jaruri|likh|likho|taiyari|ghante|ghanta|baad|wala|wali|abhi|sab)\b/gi;
+export function detectLang(text) {
+  if (/[ऀ-ॿ]/.test(text)) return 'hi';
+  const hits = (text.match(HINGLISH) || []).length;
   return hits >= 1 ? 'hinglish' : 'en';
 }
+export const say = (lang, en, hing, hi) => (lang === 'hi' ? hi || hing || en : lang === 'hinglish' ? hing || en : en);
 
-/* ---------- local time helpers ---------- */
-// ctx = { now:ms, tz:minutes (Date#getTimezoneOffset) }
-function mkCtx(now, tz) {
-  now = Number(now) || Date.now(); tz = Number.isFinite(Number(tz)) ? Number(tz) : -330;
-  return { now, tz, local: new Date(now - tz * 60000) };
+// ───────────────────────────── time parsing ─────────────────────────────
+const WEEKDAYS = { sunday: 0, sun: 0, ravivar: 0, monday: 1, mon: 1, somvar: 1, tuesday: 2, tue: 2, tues: 2, mangalvar: 2, wednesday: 3, wed: 3, budhvar: 3, thursday: 4, thu: 4, thur: 4, thurs: 4, guruvar: 4, friday: 5, fri: 5, shukravar: 5, saturday: 6, sat: 6, shanivar: 6 };
+const pad = (n) => String(n).padStart(2, '0');
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+export function localParts(nowMs, tz) {
+  const d = new Date(nowMs + tz * 60000);
+  return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate(), h: d.getUTCHours(), mi: d.getUTCMinutes(), wd: d.getUTCDay() };
 }
-const toTs = (ctx, y, mo, d, h, mi) => Date.UTC(y, mo, d, h, mi) + ctx.tz * 60000;
-function localParts(ctx, ts) {
-  const d = new Date(ts - ctx.tz * 60000);
-  return { y: d.getUTCFullYear(), mo: d.getUTCMonth(), d: d.getUTCDate(), h: d.getUTCHours(), mi: d.getUTCMinutes(), dow: d.getUTCDay() };
-}
-function dayStart(ctx, offsetDays = 0, ts = ctx.now) {
-  const p = localParts(ctx, ts);
-  return toTs(ctx, p.y, p.mo, p.d + offsetDays, 0, 0);
-}
-const WEEKDAYS = { sunday: 0, sun: 0, monday: 1, mon: 1, tuesday: 2, tue: 2, tues: 2, wednesday: 3, wed: 3, thursday: 4, thu: 4, thurs: 4, friday: 5, fri: 5, saturday: 6, sat: 6 };
-const PERIOD_DEFAULT = { morning: 8, afternoon: 14, evening: 18, night: 21 };
-function periodOf(s) {
-  if (/\b(morning|subah|subha|sawere|सुबह)\b|सुबह/.test(s)) return 'morning';
-  if (/\b(afternoon|dopahar|dophar)\b|दोपहर/.test(s)) return 'afternoon';
-  if (/\b(evening|shaam|sham|shaamko)\b|शाम/.test(s)) return 'evening';
-  if (/\b(night|raat|tonight|ratri)\b|रात/.test(s)) return 'night';
-  return null;
+export const fromLocal = (y, m, d, h, mi, tz) => Date.UTC(y, m, d, h, mi) - tz * 60000;
+export function fmtWhen(ms, tz, nowMs) {
+  const L = localParts(ms, tz), N = localParts(nowMs, tz);
+  const dayDiff = Math.round((Date.UTC(L.y, L.m, L.d) - Date.UTC(N.y, N.m, N.d)) / 864e5);
+  const day = dayDiff === 0 ? 'Today' : dayDiff === 1 ? 'Tomorrow' : dayDiff === -1 ? 'Yesterday' : `${DAY_NAMES[L.wd]} ${L.d}/${L.m + 1}`;
+  const h12 = L.h % 12 || 12;
+  return `${day} · ${h12}:${pad(L.mi)} ${L.h < 12 ? 'AM' : 'PM'}`;
 }
 
-/**
- * Find a date/time inside free text.
- * @returns {{ts:number, matched:string[], hasTime:boolean, hasDay:boolean}|null}
- */
-function parseWhen(text, ctx) {
-  const s = ' ' + text.toLowerCase() + ' ';
-  const matched = [];
-  const take = (m) => { if (m) matched.push(m[0].trim()); return m; };
+/** Parse a time expression out of free text. Returns the instant (ms) + the text with the expression removed. */
+export function parseWhen(text, ctx) {
+  const { now, tz } = ctx;
+  let t = ' ' + text.toLowerCase() + ' ';
+  const take = (re) => { const m = t.match(re); if (m) t = t.replace(m[0], ' '); return m; };
+  const N = localParts(now, tz);
+  const out = { ms: null, hasTime: false, hasDay: false, clean: text };
 
-  // relative: "in 30 minutes", "30 min baad", "2 ghante baad"
-  let m = take(s.match(/\bin\s+(\d+(?:\.\d+)?)\s*(min(?:ute)?s?|hours?|hrs?|hr)\b/) ||
-               s.match(/(\d+(?:\.\d+)?)\s*(min(?:ute)?s?|hours?|hrs?|ghant[ae]|ghanta|मिनट|घंटे)\s*(?:baad|baadh|later|mein|me|बाद)/));
+  // relative durations: "in 30 minutes", "2 ghante baad"
+  let m = take(/\b(?:in|after)\s+(\d+|an?|one|half an)\s*(minutes?|mins?|hours?|hrs?|ghante|ghanta)\b/) ||
+    take(/\b(\d+|an?|one|half an)\s*(minutes?|mins?|hours?|hrs?|ghante|ghanta)\s*(?:baad|ke baad|later|mein|me)\b/);
   if (m) {
-    const n = parseFloat(m[1]); const unit = m[2];
-    const mins = /^(h|g|घ)/.test(unit) ? n * 60 : n;
-    return { ts: ctx.now + mins * 60000, matched, hasTime: true, hasDay: false };
+    const n = /half/.test(m[1]) ? 0.5 : /^(an?|one)$/.test(m[1]) ? 1 : parseInt(m[1], 10);
+    const unit = /^(h|g)/.test(m[2]) ? 60 : 1;
+    out.ms = now + n * unit * 60000; out.hasTime = true; out.hasDay = true;
+    out.clean = t.replace(/\s+/g, ' ').trim();
+    return out;
   }
 
-  // day words
-  let dayOffset = null;
-  if ((m = take(s.match(/\b(day after tomorrow|parso)\b|परसों/)))) dayOffset = 2;
-  else if ((m = take(s.match(/\b(tomorrow|tmrw|tmr|kal)\b|कल/)))) dayOffset = 1;
-  else if ((m = take(s.match(/\b(today|aaj|tonight)\b|आज/)))) dayOffset = 0;
-  let weekday = null;
-  if (dayOffset === null && (m = take(s.match(/\b(?:on\s+|this\s+|next\s+)?(monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thu|friday|fri|saturday|sat|sunday|sun)\b/)))) {
-    weekday = WEEKDAYS[m[1]];
-  }
-  const period = periodOf(s);
-  if (period && /\b(morning|subah|subha|sawere|afternoon|dopahar|dophar|evening|shaam|sham|night|raat|tonight|ratri)\b|सुबह|दोपहर|शाम|रात/.test(s)) {
-    const pm = s.match(/\b(morning|subah|subha|sawere|afternoon|dopahar|dophar|evening|shaam|sham|night|raat|tonight|ratri)\b|सुबह|दोपहर|शाम|रात/); if (pm) matched.push(pm[0].trim());
+  // day
+  let dayOffset = null, tonight = false;
+  if (take(/\b(day after tomorrow|parso|parson)\b/)) dayOffset = 2;
+  else if (take(/\b(tomorrow|tmrw|tmr|kal|कल)\b/)) dayOffset = 1;
+  else if ((m = take(/\b(today|aaj|aj|tonight|tonite|आज)\b/))) { dayOffset = 0; tonight = /tonight|tonite/.test(m[1]); }
+  else if ((m = take(/\b(?:next\s+|this\s+|coming\s+)?(sunday|sun|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|ravivar|somvar|mangalvar|budhvar|guruvar|shukravar|shanivar)\b/))) {
+    const target = WEEKDAYS[m[1]];
+    dayOffset = ((target - N.wd + 7) % 7) || 7;
   }
 
-  // clock time
-  let h = null, mi = 0, mer = null, tm;
-  if ((tm = s.match(/(?:\b(?:at|by|@|around|before|till|tak)\s*)?\b(\d{1,2}):(\d{2})\s*(am|pm|a\.m\.|p\.m\.)?/))) { h = +tm[1]; mi = +tm[2]; mer = tm[3]; }
-  else if ((tm = s.match(/\b(\d{1,2})\s*(am|pm|a\.m\.|p\.m\.)(?![a-z])/))) { h = +tm[1]; mer = tm[2]; }
-  else if ((tm = s.match(/\b(\d{1,2})\s*(?:baje|bje|bajey|o'?clock)|(\d{1,2})\s*बजे/))) { h = +(tm[1] || tm[2]); }
-  else if ((tm = s.match(/\b(?:at|by|@|around|before)\s*(\d{1,2})\b(?!\s*(?:days?|steps?|min|hours?|hrs?|%|questions?|marks?|pages?))/))) { h = +tm[1]; }
-  if (tm) matched.push(tm[0].trim());
+  // period of day
+  let period = null;
+  if (take(/\b(morning|subah|subha|savere|सुबह)\b/)) period = 'am';
+  else if (take(/\b(afternoon|dopahar|dophar|दोपहर)\b/)) period = 'noon';
+  else if (take(/\b(evening|shaam|sham|शाम)\b/)) period = 'eve';
+  else if (take(/\b(night|raat|रात)\b/) || tonight) period = 'night';
 
-  if (h === null && dayOffset === null && weekday === null && !period) return null;
-  if (h !== null && (h > 24 || mi > 59)) return null;
+  // clock
+  let h = null, mi = 0, ampm = null;
+  if ((m = take(/\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)(?=\W|$)/))) { h = +m[1]; mi = +(m[2] || 0); ampm = m[3][0]; }
+  else if ((m = take(/\b([01]?\d|2[0-3]):([0-5]\d)\b/))) { h = +m[1]; mi = +m[2]; if (h >= 13 || h === 0) ampm = 'x'; }
+  else if ((m = take(/\b(\d{1,2})(?::(\d{2}))?\s*(?:baje|bje|o'?clock|बजे)/))) { h = +m[1]; mi = +(m[2] || 0); }
+  else if ((m = take(/\b(?:at|@|by|before|around)\s*(\d{1,2})(?::(\d{2}))?\b(?!\s*(?:pages?|questions?|problems?|chapters?|marks))/))) { h = +m[1]; mi = +(m[2] || 0); }
 
-  const L = ctx.local;
-  const base = { y: L.getUTCFullYear(), mo: L.getUTCMonth(), d: L.getUTCDate() };
-  const candidates = [];
-  const hasTime = h !== null;
-  const hasDay = dayOffset !== null || weekday !== null;
-
-  const resolveHours = () => {
-    if (h === null) {
-      if (period) return [PERIOD_DEFAULT[period]];
-      return [dayOffset === 0 ? Math.min(23, ctx.local.getUTCHours() + 2) : 9];
+  if (h !== null && h <= 24) {
+    if (ampm === 'p') h = h % 12 + 12;
+    else if (ampm === 'a') h = h % 12;
+    else if (ampm === 'x') { /* 24h */ }
+    else if (period === 'am') h = h === 12 ? 0 : h;
+    else if (period === 'noon') h = h <= 6 ? h + 12 : h;
+    else if (period === 'eve' || period === 'night') h = h < 12 ? h + 12 : h;
+    else if (h < 12) {
+      // ambiguous 12-hour clock: choose the next occurrence today, otherwise a sensible default for later days
+      if (dayOffset === null || dayOffset === 0) {
+        const c1 = fromLocal(N.y, N.m, N.d, h, mi, tz), c2 = fromLocal(N.y, N.m, N.d, h + 12, mi, tz);
+        if (c1 > now) h = h; else if (c2 > now) h = h + 12; else { h = h; dayOffset = 1; }
+      } else h = h >= 5 ? h : h + 12; // 5–11 → AM, 1–4 → PM
     }
-    if (mer) return [(h % 12) + (/^p/.test(mer) ? 12 : 0)];
-    if (h >= 13) return [h % 24];
-    if (period === 'morning') return [h % 12];
-    if (period === 'afternoon' || period === 'evening') return [(h % 12) + 12];
-    if (period === 'night') return [h >= 6 && h <= 11 ? h + 12 : (h === 12 ? 0 : h < 6 ? h : h + 12)];
-    // ambiguous
-    if (dayOffset !== null && dayOffset > 0 || weekday !== null) return [h >= 7 && h <= 11 ? h : (h % 12) + 12];
-    return [h % 12, (h % 12) + 12];
-  };
-  const hours = resolveHours();
+    if (h === 24) h = 0;
+    out.hasTime = true;
+  } else if (period) {
+    const defaults = { am: [8, 0], noon: [14, 0], eve: [18, 0], night: [21, 0] }[period];
+    [h, mi] = defaults; out.hasTime = true;
+  }
 
-  let startDay = dayOffset ?? 0;
-  if (weekday !== null) {
-    const todayDow = L.getUTCDay();
-    startDay = (weekday - todayDow + 7) % 7 || 7;
+  if (dayOffset !== null || h !== null) {
+    out.hasDay = dayOffset !== null;
+    const base = dayOffset ?? 0;
+    const hh = h ?? 9, mm = mi;
+    let ms = fromLocal(N.y, N.m, N.d + base, hh, mm, tz);
+    if (h !== null && dayOffset === null && ms <= now) ms += 864e5; // "at 7" already past → next day
+    out.ms = ms;
   }
-  for (let add = 0; add < 3; add++) {
-    for (const hh of hours) {
-      const ts = toTs(ctx, base.y, base.mo, base.d + startDay + add, hh, mi);
-      candidates.push(ts);
-    }
-    if (hasDay) break; // explicit day: do not roll
-  }
-  let ts = candidates.filter((t) => t > ctx.now - 60000).sort((a, b) => a - b)[0] ?? candidates[candidates.length - 1];
-  return { ts, matched: [...new Set(matched)].filter(Boolean), hasTime, hasDay };
-}
-
-/* ---------- clause splitting ---------- */
-function splitClauses(text) {
-  const raw = text
-    .replace(/\s+/g, ' ')
-    .split(/\s*[;\n]\s*|\s*,\s*(?=[a-zA-Zऀ-ॿ])|\s+(?:and then|and also|then|aur phir|phir|fir|और फिर|फिर)\s+|\s+(?:and|aur|और)\s+(?=(?:remind|plan|finish|add|note|set|create|make|draft|write|call|send|submit|explain|summari[sz]e|help|prepare|show|mujhe|yaad|banao|schedule|organi[sz]e)\b)/i)
-    .map((c) => c.replace(/^[\s,.]+|[\s,.!?]+$/g, '')).filter(Boolean);
-  const out = [];
-  for (const c of raw) {
-    if (out.length && c.split(' ').length < 2 && !/^(hi|hello|hey|thanks)$/i.test(c)) out[out.length - 1] += ' ' + c;
-    else out.push(c);
-  }
+  out.clean = t.replace(/\s+/g, ' ').trim();
   return out;
 }
 
-/* ---------- entity helpers ---------- */
-const FILLER = /\b(please|pls|kindly|can you|could you|will you|would you|i want to|i need to|i have to|i'd like to|i would like to|mujhe|mere liye|meri|mera|karna hai|karo|kar do|kardo|kar dena|dena|do|my|the|a|an|to)\b/gi;
-function cleanTitle(t) {
-  let x = t.replace(/\s+/g, ' ').trim();
-  x = x.replace(/^(?:and|aur|then|also)\s+/i, '');
-  x = x.replace(/[\s,.:;-]+$/g, '');
-  return x ? x[0].toUpperCase() + x.slice(1) : x;
+// ───────────────────────────── helpers ─────────────────────────────
+const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+export function cleanTitle(s) {
+  let t = ' ' + s + ' ';
+  t = t.replace(/\b(hey pragati|pragati|please|pls|plz|can you|could you|would you|i want to|i need to|i have to|i should|mujhe|mere liye|mera|meri|mere)\b/gi, ' ')
+    .replace(/\b(remind me|remind|reminder|set a reminder|set reminder|yaad dilao|yaad dila do|yaad dilana|yaad rakhna|yaad|add a task|add task|add a todo|create a task|create task|new task|task|todo|to do|karo|kardo|kar do|set)\b/gi, ' ')
+    .replace(/याद दिलाओ|याद दिला दो/g, ' ');
+  t = t.replace(/\s+/g, ' ').trim();
+  for (let i = 0; i < 3; i++) t = t.replace(/^(to|for|that|about|ko|ka|ki|ke|me|mein|at|on|by|in|the|a|an|and|aur)\s+/i, '').replace(/\s+(to|for|that|ko|ka|ki|ke|me|mein|at|on|by|in|and|aur)$/i, '');
+  return cap(t.replace(/^[\s,.\-:;]+|[\s,.\-:;]+$/g, ''));
 }
-function stripWhen(text, when) {
-  let t = text;
-  if (when) for (const m of when.matched) t = t.replace(new RegExp(m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), ' ');
-  return t.replace(/\b(at|by|on|before|for|ko|tak|me|in)\s*$/i, '').replace(/\s+/g, ' ').trim();
-}
-function priorityOf(s) {
-  if (/\b(urgent|asap|important|high priority|zaroori|jaruri|critical|immediately)\b|जरूरी|ज़रूरी/i.test(s)) return 'high';
-  if (/\b(low priority|whenever|later|someday)\b/i.test(s)) return 'low';
-  return 'normal';
+const STOP = new Set('the a an of to for and or my me i is are on in at it this that with from your please do get make new task note notes add create remind reminder me ko ka ki ke hai hain kar karo mujhe banao liye'.split(' '));
+const words = (s) => (s.toLowerCase().match(/[\p{L}\p{N}]+/gu) || []).filter((w) => w.length > 2 && !STOP.has(w));
+function bestMatch(list, text, key = 'title') {
+  const qw = new Set(words(text));
+  let best = null, score = 0;
+  for (const it of list) {
+    const iw = words(it[key]);
+    const s = iw.filter((w) => qw.has(w)).length / Math.max(1, Math.min(iw.length, qw.size));
+    if (s > score) { score = s; best = it; }
+  }
+  return score >= 0.34 ? best : null;
 }
 
-/* ---------- classification ---------- */
-const R = {
-  prepTomorrow: /(ready|prepare|prep|taiyari|tayari|तैयार|तैयारी).{0,30}(tomorrow|kal|कल)|(tomorrow|kal|कल).{0,30}(ready|prep|taiyari|tayari|तैयारी)|get ready for (the )?(day|tomorrow)/i,
-  planDay: /(plan|schedule|organi[sz]e|arrange).{0,12}(my )?(day|today)\b|\b(din|aaj) (ka|ki) (plan|schedule)|दिन (का|की) (प्लान|योजना)|aaj ka plan|plan my day/i,
-  reminder: /\b(remind|reminder|reminders|yaad|alarm|ping me|alert me|notify me)\b|याद|रिमाइंडर/i,
-  studyPlan: /(plan|schedule|timetable|organi[sz]e).{0,25}(study|studies|padhai|exam|revision|prep)|(study|studies|exam|revision|padhai).{0,15}(plan|schedule|timetable)|\bstudy plan\b|पढ़ाई.{0,10}(प्लान|योजना)|have (an? )?(exam|test)|exam (in|on|ke)|prepare for (the )?(exam|test)/i,
-  clearDone: /\b(delete|clear|remove|hata|hatao|saaf)\b.{0,20}\b(completed|done|finished|old)\b.{0,10}(tasks?|todos?)?|\bclear (all )?(done|completed)/i,
-  noteDraft: /\b(finish|complete|draft|prepare|make|create|write|banao|bana|likh|likho)\b.{0,18}\b(notes?|revision notes?)\b/i,
-  noteCreate: /^(?:please\s+)?(?:take a |make a |add a |create a )?(?:note|notes|memo|jot)\b\s*(?:down|this|that|kar|:|-)?|\bnote (?:down|this)\b|\bwrite (?:this )?down\b|नोट/i,
-  email: /\b(email|e-mail|mail|letter|application|message)\b/i,
-  emailVerb: /\b(draft|write|compose|likh|likho|banao|bana|prepare|send)\b/i,
-  summarize: /\b(summari[sz]e|summary|saaransh|tl;?dr)\b|सारांश/i,
-  explain: /^(?:please\s+)?(?:explain|samjha|samjhao|define|describe)\b|\b(what is|what are|what's|whats|kya hai|kya hota hai|meaning of|difference between|how does|how do)\b|क्या है|समझा/i,
-  query: /\b(what|show|list|kya|dikhao|dikha|batao|tell me)\b.{0,25}\b(pending|tasks?|todos?|reminders?|schedule|agenda|plan|due|left)\b|\bwhat'?s (on|pending|due)\b|\bkitne (tasks?|reminders?)\b|\bmy (tasks?|todos?|reminders?)\b\??$/i,
-  task: /\b(add|create|make|new)\b.{0,10}\b(task|todo|to-do)\b|\btodo\b|\btask\b\s*[:\-]|^(?:i )?(?:need to|have to|must|should|gotta|submit|buy|call|send|attend|finish|complete|do|pay|book|check|clean|prepare|revise|study|read|practice|solve|write|upload|email|meet|visit|pick|fill)\b|karna hai|करना है|\bmujhe\b.{2,}\b(karna|karni|jana|dena|bhejna|submit)\b/i,
-  greet: /^(hi|hello|hey|hii+|namaste|namaskar|hola|yo|good (morning|evening|afternoon|night)|नमस्ते)\b/i,
-  thanks: /\b(thanks|thank you|shukriya|dhanyavaad|dhanyawad|thx)\b|धन्यवाद|शुक्रिया/i,
-  who: /\bwho are you|what can you do|help me understand you|kaun ho|kya kar sakte|tum kya|capabilities\b/i,
+// ───────────────────────────── intent rules ─────────────────────────────
+const RX = {
+  roadmap: /\b(call|phone|dial|whatsapp|instagram|insta|facebook|twitter|linkedin|youtube|post on|publish|laptop|pc|shutdown|shut down|open (the )?app|order|book a|pay|transfer money|upi)\b|कॉल|व्हाट्सएप/i,
+  ready: /(get|getting)\s+(me\s+)?ready|ready for (tomorrow|the day|class|college|exam)|kal ki taiyari|kal ke liye taiyar|taiyari\s+(kar|karo|karwa)|तैयारी/i,
+  reminder: /\bremind|reminder|yaad\s*(dil|rakh|kar)|alarm|याद/i,
+  del: /\b(delete|remove|hata|hatao|mita|mitao|clear)\b|हटा|मिटा/i,
+  summarize: /summari[sz]e|summary|saransh|short (mein|me)|tl;?dr|सारांश/i,
+  email: /\b(e-?mail|mail)\b|ईमेल/i,
+  study: /(study|padhai|padhna|padh|revis\w*|exam|पढ़ाई|पढ़ना).*(plan|schedule|timetable|banao|bana)|(plan|schedule|timetable|banao|bana).*(study|padhai|padhna|exam|revision|पढ़ाई|पढ़ना)|study plan|padhai ka plan|पढ़ाई का प्लान/i,
+  planday: /(plan|schedule|organi[sz]e|arrange|banao).*(\bday\b|\btoday\b|aaj|\bdin\b)|\bmy day\b|daily plan|aaj ka plan|आज का प्लान/i,
+  show: /\b(what('| i)?s|show|list|tell me|kya|dikhao|batao|how many|kitne)\b.*(pending|due|left|tasks?|todo|baaki|baki|reminders?|today|schedule|notes?)\b|\bpending\b|\bbaaki\b|\bbaki\b/i,
+  note: /\b(notes?|nots|jot|write down|likh\w*|likho)\b|नोट|लिख/i,
+  complete: /\b(done|finished|completed|complete|mark)\b|ho gaya|ho gya|kar liya|khatam|पूरा|हो गया/i,
 };
 
-function classify(clause) {
-  const c = clause.trim();
-  if (R.prepTomorrow.test(c)) return 'prep_tomorrow';
-  if (R.planDay.test(c)) return 'day_plan';
-  if (R.clearDone.test(c)) return 'clear_done';
-  if (R.reminder.test(c)) return 'reminder';
-  if (R.studyPlan.test(c)) return 'study_plan';
-  if (R.noteDraft.test(c)) return 'note_draft';
-  if (R.email.test(c) && R.emailVerb.test(c)) return 'email';
-  if (R.summarize.test(c)) return 'summarize';
-  if (R.query.test(c)) return 'query';
-  if (R.explain.test(c)) return 'explain';
-  if (R.noteCreate.test(c) && c.replace(R.noteCreate, '').trim().length > 2) return 'note_create';
-  if (R.greet.test(c)) return 'greet';
-  if (R.thanks.test(c)) return 'thanks';
-  if (R.who.test(c)) return 'who';
-  if (R.task.test(c)) return 'task';
-  return 'unknown';
+let seq = 0;
+const step = (type, title, reason, params = {}, extra = {}) => ({ id: `s${++seq}`, type, title, reason, consequential: false, params, state: 'proposed', result: null, ...extra });
+
+function splitClauses(text, ctx) {
+  const raw = text.split(/\s*(?:,|;|\.\s+|\.$|\bthen\b|\band then\b|\bphir\b|\bfir\b|\baur\b|\band\b|और|फिर)\s*/i).map((s) => s.trim()).filter(Boolean);
+  const out = [];
+  for (const c of raw) {
+    const hasVerb = Object.values(RX).some((r) => r.test(c));
+    const w = parseWhen(c, ctx);
+    if (out.length && !hasVerb && w.ms && words(w.clean).length === 0) out[out.length - 1] += ' ' + c; // a lone time phrase belongs to the previous clause
+    else out.push(c);
+  }
+  return out.length ? out : [text];
 }
 
-module.exports = { detectLang, mkCtx, localParts, toTs, dayStart, parseWhen, splitClauses, classify, cleanTitle, stripWhen, priorityOf, R, FILLER };
+// ───────────────────────────── main entry ─────────────────────────────
+/**
+ * ctx: { now, tz, tasks[], notes[], docs[], reminders[] }
+ * returns { lang, steps[], reply, engine }
+ */
+export function buildPlan(text, ctx) {
+  seq = 0;
+  text = String(text || '').trim();
+  const lang = detectLang(text);
+  const clauses = splitClauses(text, ctx);
+  const steps = [];
+  const shared = { subject: null, anchor: null };
+
+  for (const clause of clauses) {
+    const when = parseWhen(clause, ctx);
+    const body = when.clean;
+    const priority = /\b(urgent|asap|important|zaroori|jaruri|jarurat|top priority)\b|जरूरी|ज़रूरी/i.test(clause) ? 'high' : 'normal';
+    const whenLabel = when.ms ? fmtWhen(when.ms, ctx.tz, ctx.now) : null;
+
+    if (RX.reminder.test(clause)) {
+      let title = cleanTitle(body.replace(RX.roadmap, ' '));
+      if (!title) title = shared.subject ? `Time to study ${shared.subject}` : steps.length ? `Start: ${steps[0].title.replace(/^(Study plan|Draft)\s*[—:-]\s*/i, '')}` : 'Pragati reminder';
+      const at = when.ms ?? (ctx.now + 3600e3);
+      steps.push(step('create_reminder', `Reminder — ${title}`, when.ms ? `You asked to be reminded ${whenLabel}.` : 'No time was given, so I proposed one hour from now — change it before approving.',
+        { title, remind_at: new Date(at).toISOString(), label: fmtWhen(at, ctx.tz, ctx.now) }, { consequential: true }));
+      if (when.ms) shared.anchor = when.ms;
+      continue;
+    }
+    if (RX.ready.test(clause)) { steps.push(...readyMacro(ctx, lang)); continue; }
+    if (RX.roadmap.test(clause) && !RX.email.test(clause)) {
+      steps.push(step('unsupported', cap(body) || 'Unsupported request', 'Calls, social posting and device control are roadmap tracks — they need platform APIs, permissions and a separate feasibility check. I will not pretend to do them.', { track: /call|phone|dial/i.test(clause) ? 'Smart calls' : /laptop|pc|shut|app/i.test(clause) ? 'Connected laptop' : 'Social workflows' }, { state: 'blocked' }));
+      continue;
+    }
+    if (RX.del.test(clause)) {
+      const pool = [...ctx.tasks.map((t) => ({ ...t, table: 'tasks' })), ...ctx.notes.map((n) => ({ ...n, table: 'notes' })), ...ctx.reminders.map((r) => ({ ...r, table: 'reminders' }))];
+      const hit = bestMatch(pool, cleanTitle(body));
+      if (hit) steps.push(step('delete_item', `Delete ${hit.table.slice(0, -1)} — ${hit.title}`, 'Deleting changes your data, so it needs your explicit OK. It can be undone right after.', { table: hit.table, id: hit.id, title: hit.title }, { consequential: true }));
+      else steps.push(step('unsupported', `Delete — ${cleanTitle(body) || 'item'}`, 'I could not find a task, note or reminder matching that. Nothing will be deleted.', {}, { state: 'blocked' }));
+      continue;
+    }
+    if (RX.summarize.test(clause)) {
+      const doc = bestMatch(ctx.docs, cleanTitle(body.replace(RX.summarize, ' '))) || ctx.docs[0];
+      if (doc) steps.push(step('summarize_doc', `Summarise — ${doc.title}`, 'Turns your uploaded document into revision notes saved as a note.', { doc_id: doc.id, title: doc.title }));
+      else steps.push(step('unsupported', 'Summarise a document', 'No document uploaded yet — add a PDF or text in the Study tab first.', {}, { state: 'blocked' }));
+      continue;
+    }
+    if (RX.email.test(clause)) {
+      const e = parseEmailAsk(body);
+      const d = draftEmail(e);
+      steps.push(step('draft_email', `Email draft — ${e.purpose}`, 'I prepare the draft only. In this MVP I never send mail on your behalf.', { ...e, subject: d.subject, body: d.body }));
+      continue;
+    }
+    if (RX.study.test(clause)) {
+      const subject = extractSubject(body) || (ctx.docs[0]?.title) || null;
+      shared.subject = subject;
+      const start = when.ms ?? nextHour(ctx);
+      const label = subject || 'your syllabus';
+      const blocks = [
+        ['Learn the core concepts', 45], ['Practice problems', 45], ['Revise & self-test', 30],
+      ].map(([what, min], i) => ({ title: `${what} — ${label}`, minutes: min, due: new Date(start + i * 60 * 60000).toISOString(), label: fmtWhen(start + i * 60 * 60000, ctx.tz, ctx.now) }));
+      shared.anchor = start;
+      steps.push(step('create_study_plan', `Study plan — ${label}`, `Three focused blocks from ${fmtWhen(start, ctx.tz, ctx.now)}, with breaks. ${ctx.docs.length ? 'Based on your latest document.' : ''}`.trim(), { subject: label, blocks }));
+      continue;
+    }
+    if (RX.planday.test(clause)) {
+      const note = planDayNote(ctx);
+      steps.push(step('create_note', "Today's plan", note.reason, { title: note.title, body: note.body, kind: 'draft' }));
+      continue;
+    }
+    if (RX.show.test(clause) && !RX.note.test(clause)) {
+      steps.push(step('show', 'Show my pending items', 'Read-only — nothing is changed.', { what: /reminder/i.test(clause) ? 'reminders' : /note/i.test(clause) ? 'notes' : 'tasks' }));
+      continue;
+    }
+    if (RX.note.test(clause)) {
+      const subject = shared.subject || extractSubject(body) || ctx.docs[0]?.title || null;
+      const n = draftStudyNotes(subject, ctx.docs);
+      steps.push(step('create_note', `Notes — ${subject || 'draft'}`, 'A structured draft you can finish yourself. I never overwrite existing notes.', { title: n.title, body: n.body, kind: 'draft' }));
+      continue;
+    }
+    if (RX.complete.test(clause) && ctx.tasks.length) {
+      const hit = bestMatch(ctx.tasks.filter((t) => !t.done), cleanTitle(body.replace(RX.complete, ' ')));
+      if (hit) { steps.push(step('complete_task', `Mark done — ${hit.title}`, 'Matched to your open task by its words.', { id: hit.id, title: hit.title })); continue; }
+    }
+    // default: a task
+    const title = cleanTitle(body);
+    if (!title) continue;
+    steps.push(step('create_task', `Task — ${title}`, when.ms ? `Due ${whenLabel}.` : 'No due time detected — it will go to your inbox.',
+      { title, due: when.ms ? new Date(when.ms).toISOString() : null, priority, label: whenLabel }));
+  }
+
+  if (!steps.length) steps.push(step('unsupported', 'I did not catch a supported action', 'Try: “Plan my study for DSA, finish my notes, remind me at 7”.', {}, { state: 'blocked' }));
+
+  const n = steps.filter((s) => s.state !== 'blocked').length;
+  const reply = n
+    ? say(lang, `${n} step${n > 1 ? 's' : ''} detected. Review each one — nothing happens until you approve.`,
+      `${n} step${n > 1 ? 's' : ''} mile. Dekh lo — jab tak approve nahi karoge, kuch nahi hoga.`,
+      `${n} चरण मिले। देख लीजिए — आपकी मंज़ूरी के बिना कुछ नहीं होगा।`)
+    : say(lang, 'I could not turn that into a supported action. Here is why.', 'Ye mujhse abhi supported action me nahi bana. Reason neeche hai.', 'यह अभी समर्थित कार्य में नहीं बदल सका। कारण नीचे है।');
+  return { lang, steps, reply, engine: 'local' };
+}
+
+function nextHour(ctx) {
+  const N = localParts(ctx.now, ctx.tz);
+  return fromLocal(N.y, N.m, N.d, N.h + 1, 0, ctx.tz);
+}
+function extractSubject(body) {
+  const m = body.match(/\b(?:for|on|about|of)\s+([a-z0-9][\w\s&+.\-]{1,40}?)(?:\s+(?:exam|test|today|tomorrow|tonight)\b|$)/i)
+    || body.match(/([\w\s&+.\-]{2,40}?)\s+(?:ke liye|ka|ki|ke)\s+(?:padhai|study|plan|revision|exam)/i);
+  const s = m ? cleanTitle(m[1]) : '';
+  return s && words(s).length ? s : null;
+}
+function parseEmailAsk(body) {
+  const to = (body.match(/\bto\s+(?:my\s+|the\s+)?([a-z][a-z .']{1,30}?)(?:\s+(?:for|about|regarding|asking|requesting|to)\b|$)/i) || [])[1];
+  const purpose = (body.match(/\b(?:for|about|regarding|asking for|requesting|ke liye)\s+(.{3,80})$/i) || [])[1] || cleanTitle(body.replace(/\b(draft|write|compose|send|an?|e-?mail|mail|to)\b/gi, ' ')) || 'a quick follow-up';
+  const tone = /\b(formal|polite|respectful)\b/i.test(body) || /professor|sir|ma'?am|hr|manager|dean|principal/i.test(to || '') ? 'formal' : 'friendly';
+  return { to: to ? cap(to.trim()) : '', purpose: purpose.trim().replace(/[.?!]+$/, ''), tone };
+}
+
+function readyMacro(ctx, lang) {
+  const N = localParts(ctx.now, ctx.tz);
+  const tomorrowStart = fromLocal(N.y, N.m, N.d + 1, 0, 0, ctx.tz), tomorrowEnd = tomorrowStart + 864e6 / 10;
+  const open = ctx.tasks.filter((t) => !t.done);
+  const dueTomorrow = open.filter((t) => t.due && Date.parse(t.due) >= tomorrowStart && Date.parse(t.due) < tomorrowEnd);
+  const brief = [
+    `# Tomorrow's brief`, '',
+    dueTomorrow.length ? `## Due tomorrow\n${dueTomorrow.map((t) => `- [ ] ${t.title}`).join('\n')}` : '## Due tomorrow\n- Nothing is scheduled yet — a good time to choose one priority.',
+    '', open.length ? `## Still open\n${open.filter((t) => !dueTomorrow.includes(t)).slice(0, 6).map((t) => `- [ ] ${t.title}${t.priority === 'high' ? '  (high)' : ''}`).join('\n') || '- Nothing else open.'}` : '',
+    '', '## Evening checklist\n- [ ] Charge phone & laptop\n- [ ] Pack bag / keep documents ready\n- [ ] Pick the ONE thing that must happen tomorrow\n- [ ] Sleep on time',
+  ].join('\n');
+  const at = fromLocal(N.y, N.m, N.d + (N.h >= 21 ? 1 : 0), 21, 0, ctx.tz);
+  return [
+    step('create_note', "Tomorrow's brief", `Built from your ${open.length} open task${open.length === 1 ? '' : 's'} (${dueTomorrow.length} due tomorrow).`, { title: "Tomorrow's brief", body: brief, kind: 'draft' }),
+    step('create_task', 'Task — Evening checklist: bag, charger, one priority', 'A small checklist task so tomorrow starts calmly.', { title: 'Evening checklist: bag, charger, one priority', due: new Date(at - 30 * 60000).toISOString(), priority: 'normal', label: fmtWhen(at - 30 * 60000, ctx.tz, ctx.now) }),
+    step('create_reminder', 'Reminder — Prepare for tomorrow', `A nudge at ${fmtWhen(at, ctx.tz, ctx.now)}.`, { title: 'Prepare for tomorrow', remind_at: new Date(at).toISOString(), label: fmtWhen(at, ctx.tz, ctx.now) }, { consequential: true }),
+  ];
+}
