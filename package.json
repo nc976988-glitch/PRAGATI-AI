@@ -1,0 +1,9 @@
+{
+  "name": "pragati-ai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pragati AI — voice-first, action-ready, human-controlled AI workspace (prototype)",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "test": "node test/api.test.js" },
+  "engines": { "node": ">=18" }
+}

@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pragati AI — Ask / Align / Act</title>
+<meta name="description" content="Pragati AI: a voice-first, human-controlled personal AI workspace that turns intention into approved action.">
+<meta name="theme-color" content="#03060d">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2303060d'/%3E%3Ccircle cx='32' cy='32' r='8' fill='none' stroke='%2319f0d8' stroke-width='3'/%3E%3Ccircle cx='32' cy='32' r='16' fill='none' stroke='%238b5cf6' stroke-width='3'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%23ff3d9a' stroke-width='3'/%3E%3Ccircle cx='32' cy='32' r='3' fill='%2319f0d8'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<canvas id="bg" aria-hidden="true"></canvas>
+<div class="spot" aria-hidden="true"></div><div class="grain"></div><div class="scan"></div><div class="vignette"></div>
+
+<!-- ─────────── BOOT / AUTH ─────────── -->
+<section id="boot" aria-label="Welcome to Pragati AI">
+  <div class="bootgrid">
+    <div class="bootcopy">
+      <span class="kicker">A new interface for everyday progress</span>
+      <h1><span class="glitch" data-t="PRAGATI">PRAGATI</span><br><span class="grad">AI</span></h1>
+      <h2>The future doesn’t wait for you.</h2>
+      <p>It understands the moment — and helps you move it forward.</p>
+      <div class="tri"><span style="--c:var(--cyan)">VOICE-FIRST</span><span style="--c:var(--blue)">ACTION-READY</span><span style="--c:var(--violet)">HUMAN-CONTROL</span></div>
+      <div class="bootline" id="bootline" aria-live="polite"></div>
+    </div>
+    <div class="bootcard glass pad" id="authcard">
+      <div class="tabs" role="tablist"><button class="on" data-tab="demo" role="tab">Demo</button><button data-tab="login" role="tab">Sign in</button><button data-tab="register" role="tab">Create account</button></div>
+      <form id="f-demo" data-form="demo">
+        <p class="muted small">Step straight into a workspace pre-loaded with <b>sample data</b> — study documents, tasks and notes — so you can feel the whole loop in 30 seconds.</p>
+        <label class="field"><span>What should I call you?</span><input type="text" name="name" placeholder="Aarav" maxlength="40" autocomplete="given-name"></label>
+        <button class="btn solid" type="submit">Enter the console →</button>
+      </form>
+      <form id="f-login" data-form="login" hidden>
+        <label class="field"><span>Email</span><input type="email" name="email" required autocomplete="email"></label>
+        <label class="field"><span>Password</span><input type="password" name="password" required autocomplete="current-password"></label>
+        <button class="btn solid" type="submit">Sign in</button>
+      </form>
+      <form id="f-register" data-form="register" hidden>
+        <label class="field"><span>Name</span><input type="text" name="name" required minlength="2" maxlength="60" autocomplete="name"></label>
+        <label class="field"><span>Email</span><input type="email" name="email" required autocomplete="email"></label>
+        <label class="field"><span>Password (8+ characters)</span><input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
+        <button class="btn solid" type="submit">Create my workspace</button>
+      </form>
+      <div class="err" id="autherr" role="alert"></div>
+      <p class="dim small mono" style="margin-top:6px">Passwords are hashed with scrypt. Nothing leaves this server.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ─────────── APP ─────────── -->
+<div id="app">
+  <header class="hud">
+    <div class="brand">
+      <div class="logo"><svg viewBox="0 0 40 40"><g class="r1"><circle cx="20" cy="20" r="17" fill="none" stroke="#ff3d9a" stroke-width="1.6" stroke-dasharray="10 6"/></g><g class="r2"><circle cx="20" cy="20" r="11.5" fill="none" stroke="#8b5cf6" stroke-width="1.6" stroke-dasharray="5 4"/></g><circle cx="20" cy="20" r="6" fill="none" stroke="#19f0d8" stroke-width="1.8"/><circle cx="20" cy="20" r="2.4" fill="#19f0d8"/></svg></div>
+      <div><b>PRAGATI AI</b><small id="crumb">PRAGATI / HOME CONSOLE</small></div>
+    </div>
+    <div class="sp"></div>
+    <span class="chip live" id="miclive" hidden><i class="dot"></i>Mic live</span>
+    <span class="chip eng" id="engchip" title="Which engine is planning your requests"><i class="dot"></i><span>…</span></span>
+    <button class="chip demo" id="demobtn" title="Scripted walk-through of the whole Pragati loop">▶ Autopilot demo</button>
+    <button class="chip" id="cmdk" title="Command palette (Ctrl/⌘ K)">⌘K</button>
+    <span class="clock" id="clock"></span>
+    <button class="avatar" id="avatar" aria-haspopup="true" aria-label="Account menu">A</button>
+  </header>
+  <div class="menu glass" id="menu" role="menu">
+    <button data-m="trust">◉ Trust center</button>
+    <button data-m="sound">♪ Sound: <span id="m-sound">on</span></button>
+    <button data-m="lock">⚿ Lock now</button>
+    <button data-m="out">⏻ Sign out</button>
+  </div>
+  <nav class="rail" id="rail" aria-label="Primary"></nav>
+  <main id="stage" tabindex="-1"></main>
+</div>
+
+<div class="demo-banner glass" id="demobanner" aria-live="polite"></div>
+<div class="democap glass" id="democap" role="status" aria-live="polite"></div>
+<div id="toasts" aria-live="polite"></div>
+<div class="overlay" id="palette"><div class="palette glass pad" role="dialog" aria-label="Command palette"><input type="text" id="pin" placeholder="Type a command…  (go to study, run demo, toggle sound)" autocomplete="off"><div class="opts" id="popts"></div></div></div>
+<div class="overlay" id="modal"><div class="modal glass pad" id="modalbody" role="dialog"></div></div>
+<div class="lock" id="lock"><div><div class="logo" style="width:84px;height:84px;margin:0 auto 18px"><svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="17" fill="none" stroke="#ff3d9a" stroke-width="1.2" stroke-dasharray="10 6"/><circle cx="20" cy="20" r="11.5" fill="none" stroke="#8b5cf6" stroke-width="1.2"/><circle cx="20" cy="20" r="6" fill="none" stroke="#19f0d8" stroke-width="1.4"/></svg></div><h2>Pragati is locked</h2><p class="muted" style="margin:8px 0 22px">Use your device authentication (fingerprint, face, PIN) to continue.<br>No biometric data ever reaches Pragati.</p><button class="btn solid" id="unlock">Unlock</button><div class="err" id="lockerr"></div></div></div>
+
+<script type="module" src="/js/main.js"></script>
+</body>
+</html>
